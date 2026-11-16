@@ -9,9 +9,6 @@
  * Binding: Documentation/devicetree/bindings/media/i2c/ovti,ov5647.yaml
  */
 
-#define CAM_DATA_LANES	1 2
-#define CAM_CLOCK_NONCONTINUOUS
-
 &{/} {
 	CAM_LABEL(ov5647_xclk): CAM_LABEL(ov5647_xclk) {
 		compatible = "fixed-clock";
@@ -38,10 +35,12 @@
 				 * Not read by the driver; the receiver derives the
 				 * same rate from PIXEL_RATE (sensor.conf [csi])
 				 */
-				link-frequencies = /bits/ 64 <204166750>;
+				link-frequencies = /bits/ 64 <CAM_LINK_FREQ>;
 				clock-lanes = <0>;
 				data-lanes = <CAM_DATA_LANES>;
+#ifdef CAM_CLOCK_NONCONTINUOUS
 				clock-noncontinuous;
+#endif
 			};
 		};
 	};

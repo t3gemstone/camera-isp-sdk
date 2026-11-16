@@ -68,10 +68,17 @@ these macros from `boards/t3-gem-o1/csi{0,1}.h`:
 | `CAM_LABEL(x)` | Label unique per port, e.g. `x_csi0` |
 | `CAM_SENSOR_EP`, `CAM_RX_EP` | The two endpoints to link |
 
-and must define `CAM_DATA_LANES` (and `CAM_CLOCK_NONCONTINUOUS` if the sensor
-uses a non-continuous clock). Copy the compatible string, I2C address,
-clock and supplies from the driver's DT binding. `camera-port.dtsi` adds the
-CSI-2 receiver side.
+and these from `[csi]` of `sensor.conf`, which the fragment uses but does
+not define:
+
+| Macro | From |
+|-------|------|
+| `CAM_DATA_LANES` | `lanes` (`1 2` for 2) |
+| `CAM_LINK_FREQ` | `link-frequency` |
+| `CAM_CLOCK_NONCONTINUOUS` | defined when `clock-noncontinuous=true` |
+
+Copy the compatible string, I2C address, clock and supplies from the
+driver's DT binding. `camera-port.dtsi` adds the CSI-2 receiver side.
 
 ```bash
 ./camera-isp-sdk overlay build ov5647
@@ -85,9 +92,12 @@ Fill in the TODOs of `sensors/ov5647/sensor.conf` (reference:
 
 * `[sensor] module` and `entity`: driver module name and the entity name
   prefix shown by `media-ctl -p`.
-* `[csi]`: lanes and the same link frequency as the overlay. A driver
-  without `V4L2_CID_LINK_FREQ` leaves the receiver to derive it as
-  PIXEL_RATE × bits / (2 × lanes); give that value (OV5647: 204166750).
+* `[csi]`: lanes, link frequency and clock mode; the overlay gets them from
+  here. A driver without `V4L2_CID_LINK_FREQ` leaves the receiver to derive
+  the frequency as PIXEL_RATE × bits / (2 × lanes); give that value
+  (OV5647: 204166750).
+* `[mode] vblank`: only if the driver's default frame length does not give
+  `fps`; `setup` warns when it does not.
 * `[ae] range0`: exposure up to the frame time, analog gain up to the
   sensor's maximum.
 * `[gain]`: the analog gain register formula. OV5647: `model=linear`,

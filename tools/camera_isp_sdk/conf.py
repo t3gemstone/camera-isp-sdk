@@ -4,11 +4,50 @@
 
 Descriptors are read both here and by GLib's GKeyFile in the GStreamer
 plugin (gst/src/camera_isp_sdk_sensor.c), so only the common subset is accepted:
-whole-line '#' comments, key=value pairs, ';'-separated lists.
+whole-line '#' comments, key=value pairs, ';'-separated lists. Numbers
+follow the C library the plugin uses: integers as strtoll() with base 0
+(decimal, 0x hexadecimal, leading-0 octal), finite numbers as strtod().
 """
 
 import configparser
+import math
+import re
 from pathlib import Path
+
+# g_ascii_strtoll(base 0) syntax: no '_', '0b' or '0o' as Python's int(x, 0) has
+_INT_RE = re.compile(r"[+-]?(?:0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)")
+# g_ascii_strtod() syntax, decimal or hexadecimal; no '_', 'inf' or 'nan'
+_FLOAT_RE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+_HEX_FLOAT_RE = re.compile(r"[+-]?0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)(?:[pP][+-]?\d+)?")
+
+
+def parse_int(text):
+    """Parses an integer as the plugin's g_ascii_strtoll(text, &end, 0) does.
+
+    Raises ValueError for anything it would not consume entirely.
+    """
+    if not _INT_RE.fullmatch(text):
+        raise ValueError(text)
+    sign = -1 if text[0] == "-" else 1
+    digits = text.lstrip("+-")
+    if digits[:2].lower() == "0x":
+        return sign * int(digits[2:], 16)
+    if len(digits) > 1 and digits[0] == "0":
+        return sign * int(digits, 8)
+    return sign * int(digits)
+
+
+def parse_float(text):
+    """Parses a finite number as the plugin's g_ascii_strtod() + isfinite() do."""
+    if _FLOAT_RE.fullmatch(text):
+        value = float(text)
+    elif _HEX_FLOAT_RE.fullmatch(text):
+        value = float.fromhex(text)
+    else:
+        raise ValueError(text)
+    if not math.isfinite(value):
+        raise ValueError(text)
+    return value
 
 
 class ConfError(Exception):
@@ -58,8 +97,11 @@ class Conf:
         raw = self.str(section, key, required=required)
         if raw is None:
             return default
+        return self._check_int(section, key, raw, lo, hi)
+
+    def _check_int(self, section, key, raw, lo=None, hi=None):
         try:
-            value = int(raw, 0)
+            value = parse_int(raw)
         except ValueError:
             raise ConfError(f"{self._where(section, key)}: expected an integer, got '{raw}'") from None
         if lo is not None and value < lo:
@@ -73,7 +115,7 @@ class Conf:
         if raw is None:
             return default
         try:
-            return float(raw)
+            return parse_float(raw)
         except ValueError:
             raise ConfError(f"{self._where(section, key)}: expected a number, got '{raw}'") from None
 
@@ -96,11 +138,6 @@ class Conf:
             items.pop()
         return items
 
-    def int_list(self, section, key, required=False):
-        out = []
-        for item in self.list(section, key, required=required):
-            try:
-                out.append(int(item, 0))
-            except ValueError:
-                raise ConfError(f"{self._where(section, key)}: '{item}' is not an integer") from None
-        return out
+    def int_list(self, section, key, required=False, lo=None, hi=None):
+        return [self._check_int(section, key, item, lo, hi)
+                for item in self.list(section, key, required=required)]

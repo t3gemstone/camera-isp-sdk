@@ -2,15 +2,17 @@
 /*
  * T3 Gemstone O1 camera port plumbing, shared by all sensors.
  *
- * Included after the sensor fragment, which must define CAM_DATA_LANES and
- * a sensor endpoint labelled CAM_SENSOR_EP. Defining CAM_CLOCK_NONCONTINUOUS
- * marks the CSI-2 clock lane as non-continuous on the receiver side too.
+ * Included after the sensor fragment, which must define a sensor endpoint
+ * labelled CAM_SENSOR_EP. CAM_DATA_LANES and CAM_CLOCK_NONCONTINUOUS come from
+ * [csi] of the sensor descriptor (camera-isp-sdk defines them in the overlay it
+ * generates); the latter marks the CSI-2 clock lane as non-continuous on the
+ * receiver side.
  *
  * Copyright (C) 2026 T3 Foundation
  */
 
 #ifndef CAM_DATA_LANES
-#error "the sensor overlay fragment must define CAM_DATA_LANES"
+#error "CAM_DATA_LANES is not defined; build overlays with camera-isp-sdk overlay build"
 #endif
 
 &CAM_I2C {

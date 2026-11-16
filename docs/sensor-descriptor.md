@@ -8,7 +8,10 @@ both:
 
 * comments are whole lines starting with `#` (no trailing comments);
 * lists are separated by `;`;
-* integers may be decimal or `0x` hexadecimal; booleans are `true` or `false`.
+* integers may be decimal, `0x` hexadecimal or, with a leading `0`, octal
+  (`010` is 8), as C's `strtoll()` reads them; no `_` separators;
+* numbers are finite decimals such as `0.3` or `1e3` (no `inf` or `nan`);
+* booleans are `true` or `false`.
 
 `camera-isp-sdk validate` and the plugin apply the same rules, and the unit tests
 load every shipped descriptor with both parsers.
@@ -32,15 +35,19 @@ The mode `camera-isp-sdk setup` configures and the ISP is tuned for.
 |-----|----------|---------|
 | `width`, `height` | yes | Output size of the sensor. The width must be a multiple of 8 for RAW10/RAW12 and of 16 for RAW8 (capture DMA). |
 | `code` | yes | Media bus code as `media-ctl` spells it: `S{BGGR,GBRG,GRBG,RGGB}{8,10,12}_1X{8,10,12}`. Gives the Bayer order and bit depth; the demosaic (CFA) tuning must be for the same order (`camera-isp-sdk dcc fit-cfa`). |
-| `fps` | | Frame rate, default 30. Used for bandwidth and exposure checks and for the GStreamer caps. |
+| `fps` | | Frame rate, default 30. Used for bandwidth and exposure checks and for the GStreamer caps. `setup` warns when the driver's timing (`PIXEL_RATE`, `HBLANK`, `VBLANK`) gives a rate more than 5% off. |
+| `vblank` | | `V4L2_CID_VBLANK` that `setup` sets after the format, which resets it to the driver's default. Set it when that default does not give `fps`: frame lines = `PIXEL_RATE` / (fps × (width + `HBLANK`)), `vblank` = frame lines − height. |
 
 ## [csi]
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `lanes` | yes | Data lanes. Both T3 Gemstone O1 connectors have 2. |
-| `link-frequency` | yes | CSI-2 link frequency in Hz; must match `link-frequencies` in the overlay. |
-| `clock-noncontinuous` | | Informational, default false. The overlay sets the actual property. |
+| `lanes` | yes | Data lanes. Both T3 Gemstone O1 connectors have 2. The overlay gets `CAM_DATA_LANES` = `1 2 …` up to this. |
+| `link-frequency` | yes | CSI-2 link frequency in Hz. The overlay gets it as `CAM_LINK_FREQ` for `link-frequencies`. |
+| `clock-noncontinuous` | | Default false. When true the overlay gets `CAM_CLOCK_NONCONTINUOUS`, which sets `clock-noncontinuous` on both endpoints. |
+
+The overlay fragment does not define these macros itself, so `validate`
+checks the link the overlay programs.
 
 ## [overlay]
 
@@ -55,7 +62,7 @@ The mode `camera-isp-sdk setup` configures and the ISP is tuned for.
 |-----|----------|---------|
 | `dcc-id` | yes | Camera module ID of the DCC files (0..65535). Must equal `camera_module_id` in every DCC XML; on a mismatch TI's parser rejects the DCC data ("Invalid Camera Id" in the logs) and the ISP runs on defaults. Pick one not used by another sensor. |
 | `dcc-dir` | | Where the DCC binaries are on the board. Default `/opt/imaging/<id>/linear`. |
-| `dcc-viss`, `dcc-2a`, `dcc-ldc` | | File names in `dcc-dir`. Defaults `dcc_viss.bin`, `dcc_2a.bin`, and `dcc_ldc.bin` when `[dcc] ldc` is set (otherwise no LDC). |
+| `dcc-viss`, `dcc-2a`, `dcc-ldc` | | File names in `dcc-dir`. Defaults `dcc_viss.bin`, `dcc_2a.bin`, and `dcc_ldc.bin` when `[dcc] ldc` is set (otherwise no LDC). With `[dcc]` sources, `dcc-ldc` needs `[dcc] ldc` to build it from. |
 | `format-msb` | | Index of the most significant data bit, default bit depth − 1. Passed to `tiovxisp format-msb`. |
 
 ## [dcc]
@@ -131,6 +138,7 @@ width=1920
 height=1080
 code=SRGGB12_1X12
 fps=50
+vblank=413
 
 [csi]
 lanes=2

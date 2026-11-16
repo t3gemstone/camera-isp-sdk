@@ -8,8 +8,6 @@
  * Raspberry Pi kernel.
  */
 
-#define CAM_DATA_LANES	1 2
-
 &{/} {
 	CAM_LABEL(imx477_xclk): CAM_LABEL(imx477_xclk) {
 		compatible = "fixed-clock";
@@ -34,9 +32,12 @@
 			CAM_SENSOR_EP: endpoint {
 				remote-endpoint = <&CAM_RX_EP>;
 				/* D-PHY timings are tuned for 450 MHz, others use auto */
-				link-frequencies = /bits/ 64 <450000000>;
+				link-frequencies = /bits/ 64 <CAM_LINK_FREQ>;
 				clock-lanes = <0>;
 				data-lanes = <CAM_DATA_LANES>;
+#ifdef CAM_CLOCK_NONCONTINUOUS
+				clock-noncontinuous;
+#endif
 			};
 		};
 	};

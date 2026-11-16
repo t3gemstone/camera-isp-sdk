@@ -8,6 +8,7 @@ import os
 import shutil
 import struct
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -18,7 +19,7 @@ from unittest import mock
 
 from camera_isp_sdk import board as board_mod
 from camera_isp_sdk import checks, cli, dcc, descriptor, install, media, overlay, pipeline
-from camera_isp_sdk.conf import ConfError
+from camera_isp_sdk.conf import ConfError, parse_float, parse_int
 
 ROOT = Path(__file__).resolve().parents[3]
 BOARD = board_mod.load(ROOT / "boards" / "t3-gem-o1")
@@ -49,8 +50,23 @@ def write_sensor(tmp, text, name="cam"):
     d = Path(tmp) / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "sensor.conf").write_text(text)
-    (d / "overlay.dtsi").write_text("#define CAM_DATA_LANES 1 2\n")
+    (d / "overlay.dtsi").write_text("/* sensor fragment */\n")
     return d
+
+
+def copy_root(tmp, sensors=("imx230",)):
+    """A data root in tmp with the board, the template and some sensors."""
+    tmp = Path(tmp)
+    for d in ("boards", "include", "sensors/_template", *(f"sensors/{s}" for s in sensors)):
+        shutil.copytree(ROOT / d, tmp / d)
+    return tmp
+
+
+def run_cli(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+        status = cli.main([str(a) for a in argv])
+    return status, out.getvalue(), err.getvalue()
 
 
 class DescriptorTest(unittest.TestCase):
@@ -86,11 +102,60 @@ class DescriptorTest(unittest.TestCase):
             "inverse without k": MINIMAL.replace("k=256\n", ""),
             "unknown gain model": MINIMAL.replace("model=inverse", "model=magic"),
             "inline comment": MINIMAL.replace("k=256", "k=256 # sony"),
+            # What the plugin's g_ascii_strtoll()/g_ascii_strtod() reject
+            "digit separator": MINIMAL.replace("1024;8192", "1_024;8192"),
+            "binary": MINIMAL.replace("1024;8192", "0b10000000000;8192"),
+            "0o octal": MINIMAL.replace("1024;8192", "0o2000;8192"),
+            "negative exposure": MINIMAL.replace("range0=100;", "range0=-1;"),
+            "exposure above 32 bits": MINIMAL.replace("33000;", "4294967296;"),
+            "table gain 0": MINIMAL.replace("model=inverse\nk=256", "model=table\ntable=0:0;2048:16"),
+            "nan": MINIMAL.replace("k=256", "k=nan"),
+            "inf": MINIMAL.replace("k=256", "k=inf"),
+            "float separator": MINIMAL.replace("k=256", "k=2_56"),
         }
         for name, text in cases.items():
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 with self.assertRaises(ConfError):
                     descriptor.load(write_sensor(tmp, text))
+
+
+    def test_c_number_syntax(self):
+        self.assertEqual([parse_int(x) for x in ("0", "42", "-7", "+7", "0x1F", "010")], [0, 42, -7, 7, 31, 8])
+        for bad in ("", "08", "0x", "1_0", "0b1", "0o7", " 1", "1.0"):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                parse_int(bad)
+        self.assertEqual([parse_float(x) for x in ("0.3", "-1", "1e3", ".5", "0x1p3")], [0.3, -1, 1000, 0.5, 8])
+        for bad in ("nan", "inf", "-Infinity", "1e999", "1_0", ""):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                parse_float(bad)
+
+    def test_dcc_ldc_needs_sources(self):
+        text = (ROOT / "sensors/imx477/sensor.conf").read_text().replace("dcc-id=477", "dcc-id=477\ndcc-ldc=dcc_ldc.bin")
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ConfError, r"\[dcc\] ldc lists none"):
+            descriptor.load(write_sensor(tmp, text, "imx477"))
+
+    def test_vblank(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(descriptor.load(write_sensor(tmp, MINIMAL)).mode.vblank)
+            s = descriptor.load(write_sensor(tmp, MINIMAL.replace("[csi]", "vblank=413\n[csi]")))
+            self.assertEqual(s.mode.vblank, 413)
+
+    def test_search_path_matches_plugin(self):
+        header = (ROOT / "gst/src/camera_isp_sdk_sensor.h").read_text()
+        self.assertIn(f'#define CAMERA_ISP_SDK_SENSOR_PATH_ENV "{descriptor.SENSOR_PATH_ENV}"', header)
+        self.assertIn(f'"{descriptor.SENSOR_PATH_DEFAULT}"', header)
+
+    def test_plugin_descriptor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "etc", Path(tmp) / "share"
+            (second / "cam").mkdir(parents=True)
+            (second / "cam/sensor.conf").write_text("")
+            env = {descriptor.SENSOR_PATH_ENV: f"{first}::{second}"}
+            self.assertEqual(descriptor.plugin_descriptor("cam", env), second / "cam/sensor.conf")
+            first.mkdir()
+            (first / "cam.conf").write_text("")
+            self.assertEqual(descriptor.plugin_descriptor("cam", env), first / "cam.conf")
+            self.assertIsNone(descriptor.plugin_descriptor("other", env))
 
 
 class ChecksTest(unittest.TestCase):
@@ -167,6 +232,37 @@ class DccTest(unittest.TestCase):
             grid = dcc.read_h3a(Path(tmp) / "newcam_h3a_aewb_dcc.xml")
             self.assertEqual(dcc.check_h3a(grid, 2016, 1520), [])
             self.assertEqual(dcc.read_cfa_bayer(Path(tmp) / "newcam_cfa_dcc.xml"), "rggb")
+
+    def test_bootstrap_includes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_root(tmp)
+            src = root / "sensors/imx230/dcc/linear"
+            (src / "luts").mkdir()
+            shutil.copy(src / "lut_cfa_global.txt", src / "imx230_lut.txt")
+            shutil.copy(src / "lut_remap_16bto10b.txt", src / "luts/x.txt")
+            shutil.copy(src / "imx230_viss_blc.xml", src / "luts/imx230_blc.xml")
+            cfa = src / "imx230_cfa_dcc.xml"
+            cfa.write_text(cfa.read_text().replace('#include "lut_cfa_global.txt"', '#include "imx230_lut.txt"'))
+            mux = src / "imx230_h3a_mux_luts_dcc.xml"
+            mux.write_text(mux.read_text().replace('#include "lut_remap_16bto10b.txt"', '#include "luts/x.txt"'))
+            conf = root / "sensors/imx230/sensor.conf"
+            conf.write_text(conf.read_text().replace("\nviss=", "\nviss=luts/imx230_blc.xml;"))
+            template = descriptor.load(root / "sensors/imx230")
+
+            dest = Path(tmp) / "new"
+            renames = dcc.bootstrap(template, "newcam", 4321, dest, 1920, 1080)
+            self.assertEqual(renames["imx230_lut.txt"], "newcam_lut.txt")
+            self.assertEqual(renames["luts/imx230_blc.xml"], "luts/newcam_blc.xml")
+            self.assertEqual(set(dcc.xml_module_ids(dest / "luts/newcam_blc.xml")), {4321})
+            self.assertIn('#include "newcam_lut.txt"', (dest / "newcam_cfa_dcc.xml").read_text())
+            self.assertIn('#include "luts/x.txt"', (dest / "newcam_h3a_mux_luts_dcc.xml").read_text())
+            self.assertTrue((dest / "luts/x.txt").is_file())
+
+            status, out, _ = run_cli("--root", root, "new", "newcam", "--width", 1920, "--height", 1080,
+                                     "--code", "SRGGB10_1X10", "--dcc-id", 4321)
+            self.assertEqual(status, 0, out)
+            status, out, _ = run_cli("--root", root, "validate", "newcam")
+            self.assertEqual(status, 0, out)
 
     def test_bootstrap_bayer(self):
         template = descriptor.discover(ROOT / "sensors")["imx230"]
@@ -382,6 +478,53 @@ class MediaTest(unittest.TestCase):
         self.assertEqual(cam.video_link, "/dev/video-imx477-cam0")
 
 
+    def camera(self):
+        s = descriptor.discover(ROOT / "sensors")["imx477"]
+        return media.Camera(s, 0, "/dev/media0", "imx477 2-001a", "/dev/v4l-subdev2",
+                            "cdns_csi2rx.30101000.csi-bridge", "30102000.ticsi2rx", "/dev/video2")
+
+    def test_configure(self):
+        commands = []
+
+        def run(tool, device, *args):
+            commands.append((tool, *args))
+            if args[0] == "--get-v4l2":
+                return '\t\t[fmt:SRGGB12_1X12/1920x1080 field:none]'
+            if args[0].startswith("--get-ctrl"):
+                return "pixel_rate: 840000000\nhorizontal_blanking: 9332\nvertical_blanking: 413\n"
+            return ""
+
+        cam = self.camera()
+        with mock.patch.object(media, "_run", run), mock.patch.object(media.os, "symlink") as symlink, \
+                mock.patch.object(media.os, "replace"):
+            media.configure(cam, log=lambda _: None)
+        self.assertIn(("v4l2-ctl", "--set-ctrl=vertical_blanking=413"), commands)
+        self.assertAlmostEqual(cam.frame_rate, 50, places=1)
+        symlink.assert_any_call("/dev/video2", "/dev/video-imx477-cam0.tmp")
+
+    def test_configure_wrong_format_leaves_links(self):
+        def run(tool, device, *args):
+            return "[fmt:SRGGB12_1X12/4056x3040 field:none]" if args[0] == "--get-v4l2" else ""
+
+        with mock.patch.object(media, "_run", run), mock.patch.object(media.os, "symlink") as symlink:
+            with self.assertRaisesRegex(media.MediaError, "driver chose"):
+                media.configure(self.camera(), log=lambda _: None)
+        symlink.assert_not_called()
+
+    def test_configure_link_error(self):
+        def run(tool, device, *args):
+            return "[fmt:SRGGB12_1X12/1920x1080 field:none]" if args[0] == "--get-v4l2" else ""
+
+        with mock.patch.object(media, "_run", run), \
+                mock.patch.object(media.os, "symlink", side_effect=PermissionError(13, "Permission denied")):
+            with self.assertRaisesRegex(media.MediaError, "Permission denied"):
+                media.configure(self.camera(), log=lambda _: None)
+
+    def test_frame_rate_without_controls(self):
+        with mock.patch.object(media, "_run", side_effect=media.MediaError("unknown control")):
+            self.assertIsNone(media.frame_rate("/dev/v4l-subdev2", 1920, 1080))
+
+
 class PipelineTest(unittest.TestCase):
     def test_display(self):
         s = descriptor.discover(ROOT / "sensors")["imx477"]
@@ -433,6 +576,23 @@ class InstallTest(unittest.TestCase):
                  "gst/src/camera_isp_sdk_sensor.c", "gst/src/camera_isp_sdk_sensor.h", "sensors/imx219/sensor.conf"])
             self.assertTrue((tmp / "dest/lib/modules/6.12.24-ti/updates/imx219.ko").is_file())
 
+    def test_package_mtime(self):
+        # A constant mtime would let Python keep the previous version's .pyc
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "stage/usr/lib").mkdir(parents=True)
+            py = tmp / "stage/usr/lib/a.py"
+            py.write_text("x = 1\n")
+            os.utime(py, (1_800_000_000, 1_800_000_000))
+            for epoch, expected in ((None, 1_800_000_000), ("1700000000", 1_700_000_000), ("1900000000", 1_800_000_000)):
+                env = {} if epoch is None else {"SOURCE_DATE_EPOCH": epoch}
+                with self.subTest(epoch=epoch), mock.patch.dict(os.environ, env):
+                    if epoch is None:
+                        os.environ.pop("SOURCE_DATE_EPOCH", None)
+                    install.package(tmp / "stage", tmp / "p.tar.gz")
+                    with tarfile.open(tmp / "p.tar.gz") as tar:
+                        self.assertEqual([m.mtime for m in tar.getmembers()], [expected])
+
 
 class CliTest(unittest.TestCase):
     def test_host_commands_refused_on_installed_root(self):
@@ -447,6 +607,37 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(cli.main(["--root", tmp, "overlay", "build"]), 1)
                 self.assertEqual(cli.main(["--root", tmp, "list"]), 0)
             self.assertIn("'overlay build' works on the camera-isp-sdk source tree", err.getvalue())
+
+    def test_validate_only_named_broken_sensor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_root(tmp, ("imx219", "imx230"))
+            conf = root / "sensors/imx230/sensor.conf"
+            conf.write_text(conf.read_text().replace("fps=30", "fps=abc"))
+            status, out, err = run_cli("--root", root, "validate", "imx230")
+        self.assertEqual(status, 1)
+        self.assertIn("imx230: FAIL", out)
+        self.assertNotIn("imx219", out + err)
+
+    def test_new_without_dcc_bits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_root(tmp)
+            conf = root / "sensors/imx230/sensor.conf"
+            conf.write_text("\n".join(line for line in conf.read_text().splitlines() if not line.startswith("bits=")))
+            status, out, _ = run_cli("--root", root, "new", "cam", "--width", 1920, "--height", 1080,
+                                     "--code", "SRGGB10_1X10", "--dcc-id", 4321)
+            self.assertEqual(status, 0, out)
+            self.assertNotIn("None-bit", out)
+            self.assertIsNone(descriptor.load(root / "sensors/cam").dcc_bits)
+
+    def test_pipeline_run_keeps_overrides(self):
+        for env, expected in (({}, f"{descriptor.SENSOR_OVERRIDE_DIR}:{ROOT / 'sensors'}"),
+                              ({descriptor.SENSOR_PATH_ENV: "/x"}, "/x")):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env), \
+                    mock.patch.object(cli.subprocess, "call", return_value=0) as call:
+                if not env:
+                    os.environ.pop(descriptor.SENSOR_PATH_ENV, None)
+                self.assertEqual(run_cli("--root", ROOT, "pipeline", "imx477", "--run")[0], 0)
+                self.assertEqual(call.call_args.kwargs["env"][descriptor.SENSOR_PATH_ENV], expected)
 
     def test_driver_build(self):
         out = io.StringIO()
@@ -472,6 +663,19 @@ class CliTest(unittest.TestCase):
                              capture_output=True, text=True, check=True)
         self.assertEqual(res.stdout.strip(), cli.gst_source_hash(ROOT / "gst"))
 
+    @unittest.skipUnless(shutil.which("bash"), "bash is required")
+    def test_build_sh_reports_missing_plugin(self):
+        # With errexit and pipefail a failing gst-inspect-1.0 used to end the
+        # script silently in plugin="$(plugin_file)".
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "gst-inspect-1.0"
+            fake.write_text("#!/bin/sh\nexit 1\n")
+            fake.chmod(0o755)
+            res = subprocess.run(["bash", str(ROOT / "gst/build.sh"), "--restore"], capture_output=True, text=True,
+                                 env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}"})
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("tiovxisp is not installed", res.stderr)
+
 
 @unittest.skipUnless(shutil.which("cpp") and shutil.which("dtc"), "cpp and dtc are required")
 class OverlayTest(unittest.TestCase):
@@ -482,6 +686,41 @@ class OverlayTest(unittest.TestCase):
                 for port in s.ports:
                     dtbo = overlay.build(ROOT, BOARD, s, port, tmp)
                     self.assertGreater(dtbo.stat().st_size, 0)
+
+    def test_csi_from_descriptor(self):
+        s = descriptor.discover(ROOT / "sensors")["imx230"]
+        self.assertEqual(overlay.csi_defines(s), ["#define CAM_DATA_LANES\t1 2", "#define CAM_LINK_FREQ\t493500000",
+                                                  "#define CAM_CLOCK_NONCONTINUOUS"])
+        with tempfile.TemporaryDirectory() as tmp:
+            dts = Path(tmp) / "imx230.dts"
+            for lanes, freq in ((2, 493500000), (1, 300000000)):
+                with self.subTest(lanes=lanes):
+                    dtbo = overlay.build(ROOT, BOARD, replace(s, lanes=lanes, link_frequency=freq), "csi0", tmp)
+                    subprocess.run(["dtc", "-q", "-I", "dtb", "-O", "dts", "-o", str(dts), str(dtbo)], check=True)
+                    text = dts.read_text()
+                    self.assertIn(f"link-frequencies = <0x00 {freq:#x}>", text)
+                    self.assertIn("data-lanes = <0x01 0x02>" if lanes == 2 else "data-lanes = <0x01>", text)
+
+    def test_fragment_must_not_define_csi(self):
+        s = descriptor.discover(ROOT / "sensors")["imx219"]
+        with tempfile.TemporaryDirectory() as tmp:
+            fragment = Path(tmp) / "overlay.dtsi"
+            fragment.write_text("#define CAM_DATA_LANES\t1\n" + s.overlay.read_text())
+            s = replace(s, overlay=fragment)
+            self.assertTrue(any("defines CAM_DATA_LANES" in e for e in checks.check(s, BOARD)[0]))
+            with self.assertRaisesRegex(overlay.OverlayError, "CAM_DATA_LANES"):
+                overlay.build(ROOT, BOARD, s, "csi0", tmp)
+
+    def test_new_ids_make_valid_labels(self):
+        self.assertEqual([overlay.dt_label(i) for i in ("imx477", "my-cam", "5640")], ["imx477", "my_cam", "cam_5640"])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_root(tmp)
+            for i, sid in enumerate(("my-cam", "5640")):
+                status, out, err = run_cli("--root", root, "new", sid, "--width", 1920, "--height", 1080,
+                                           "--code", "SRGGB10_1X10", "--dcc-id", 4000 + i)
+                self.assertEqual(status, 0, out + err)
+                status, out, err = run_cli("--root", root, "--build-dir", Path(tmp) / "build", "overlay", "build", sid)
+                self.assertEqual(status, 0, out + err)
 
 
 if __name__ == "__main__":

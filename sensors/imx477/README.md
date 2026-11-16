@@ -37,7 +37,9 @@ the sensor is tuned (`docs/tuning.md`).
 ## Other modes
 
 Edit `[mode]`, then `camera-isp-sdk dcc fit-h3a imx477` and adjust `[ae] range0` to
-the new frame time. Full resolution (4056x3040) runs at 10 fps over the two
+the new frame time. `vblank` is for 1920x1080 at 50 fps: remove it to get
+the driver's default frame length, or recompute it for the new mode
+(docs/sensor-descriptor.md). Full resolution (4056x3040) runs at 10 fps over the two
 lanes.
 
 ## Bring-up checklist

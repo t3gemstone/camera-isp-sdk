@@ -16,6 +16,7 @@ Layout (relative to DESTDIR):
 Overlay and driver sources are not packed, only what is built from them.
 """
 
+import os
 import re
 import shutil
 import tarfile
@@ -93,6 +94,19 @@ def stage(root, board, sensors, build_dir, destdir, log=print):
     return destdir
 
 
+def _mtime(path):
+    """mtime of a packed file: its own, at most $SOURCE_DATE_EPOCH if set.
+
+    Not a constant: Python reuses a __pycache__/*.pyc whose recorded source
+    mtime and size match, so with the same mtime in every package an upgrade
+    would keep running the old bytecode of each module whose size did not
+    change.
+    """
+    mtime = int(path.stat().st_mtime)
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    return min(mtime, int(epoch)) if epoch else mtime
+
+
 def package(destdir, out_file):
     """Packs a staged tree into a tarball to unpack over / on the board."""
     destdir = Path(destdir)
@@ -106,7 +120,7 @@ def package(destdir, out_file):
             info = tar.gettarinfo(str(path), arcname=str(path.relative_to(destdir)))
             info.uid = info.gid = 0
             info.uname = info.gname = "root"
-            info.mtime = 0
+            info.mtime = _mtime(path)
             with open(path, "rb") as f:
                 tar.addfile(info, f)
     return out_file

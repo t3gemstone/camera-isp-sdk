@@ -7,17 +7,26 @@ The format is documented in docs/sensor-descriptor.md. The [isp], [ae],
 tiovxisp element; keep the rules here in sync with gst/src/camera_isp_sdk_sensor.c.
 """
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .conf import Conf, ConfError
+from .conf import Conf, ConfError, parse_int
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 GAIN_UNITY = 1024
+# Limits of the plugin's parser (G_MAXUINT32, G_MININT32, G_MAXINT32)
+UINT32_MAX = 0xFFFFFFFF
+INT32_MIN, INT32_MAX = -0x80000000, 0x7FFFFFFF
 MAX_AE_RANGES = 10
 STATUSES = ("supported", "experimental", "untested")
 DCC_BUNDLES = ("viss", "2a", "ldc")
+
+# Where the plugin looks descriptors up (gst/src/camera_isp_sdk_sensor.h)
+SENSOR_PATH_ENV = "CAMERA_ISP_SDK_SENSOR_PATH"
+SENSOR_OVERRIDE_DIR = "/etc/camera-isp-sdk/sensors"
+SENSOR_PATH_DEFAULT = f"{SENSOR_OVERRIDE_DIR}:/usr/share/camera-isp-sdk/sensors"
 
 # media bus code -> (bayer order, bits per pixel)
 MBUS_CODES = {}
@@ -37,6 +46,8 @@ class Mode:
     height: int
     code: str
     fps: int
+    # V4L2_CID_VBLANK 'camera-isp-sdk setup' sets; None keeps the driver's default
+    vblank: int | None = None
 
     @property
     def bayer(self):
@@ -111,7 +122,7 @@ def _ae(conf):
         key = f"range{i}"
         if not conf.has("ae", key):
             break
-        values = conf.int_list("ae", key)
+        values = conf.int_list("ae", key, lo=0, hi=UINT32_MAX)
         if len(values) != 6:
             raise ConfError(f"{conf.path}: [ae] {key}: expected 6 values: exposure-min-us;"
                             "exposure-max-us;again-min;again-max;dgain-min;dgain-max")
@@ -131,7 +142,7 @@ def _ae(conf):
         raise ConfError(f"{conf.path}: [ae] target-brightness: {target} is outside "
                         "[target-brightness-min, target-brightness-max]")
     conf.int("ae", "threshold", 1, lo=0, hi=255)
-    conf.int("ae", "exposure-step", 1, lo=1)
+    conf.int("ae", "exposure-step", 1, lo=1, hi=UINT32_MAX)
     conf.bool("ae", "enable-blc", True)
     return ranges
 
@@ -139,9 +150,9 @@ def _ae(conf):
 def _exposure(conf):
     model = conf.str("exposure", "model", "lines")
     if model == "lines":
-        conf.int("exposure", "line-time-ns", 0, lo=0)
+        conf.int("exposure", "line-time-ns", 0, lo=0, hi=UINT32_MAX)
     elif model == "time":
-        conf.int("exposure", "unit-ns", required=True, lo=1)
+        conf.int("exposure", "unit-ns", required=True, lo=1, hi=UINT32_MAX)
     else:
         raise ConfError(f"{conf.path}: [exposure] model: expected lines or time, got '{model}'")
     return model
@@ -168,9 +179,12 @@ def _gain(conf):
             if len(parts) != 2:
                 raise ConfError(f"{conf.path}: [gain] table: expected gain:code, got '{point}'")
             try:
-                int(parts[0], 0), int(parts[1], 0)
+                gain, code = parse_int(parts[0].strip()), parse_int(parts[1].strip())
             except ValueError:
                 raise ConfError(f"{conf.path}: [gain] table: expected gain:code, got '{point}'") from None
+            if not 1 <= gain <= UINT32_MAX or not INT32_MIN <= code <= INT32_MAX:
+                raise ConfError(f"{conf.path}: [gain] table: '{point}' is out of range: gain must be within "
+                                f"[1, {UINT32_MAX}], code within [{INT32_MIN}, {INT32_MAX}]")
     else:
         raise ConfError(f"{conf.path}: [gain] model: expected linear, inverse, db or table, got '{model}'")
     return model
@@ -201,6 +215,7 @@ def load(path):
         height=conf.int("mode", "height", required=True, lo=1),
         code=code,
         fps=conf.int("mode", "fps", 30, lo=1),
+        vblank=conf.int("mode", "vblank", None, lo=0),
     )
 
     driver = conf.str("sensor", "driver")
@@ -221,6 +236,9 @@ def load(path):
             raise ConfError(f"{path}: [dcc] viss and 2a component lists are required")
         if bundles["ldc"] and not dcc_files["ldc"]:
             dcc_files["ldc"] = "dcc_ldc.bin"
+        elif dcc_files["ldc"] and not bundles["ldc"]:
+            raise ConfError(f"{path}: [isp] dcc-ldc: {dcc_files['ldc']} is built from [dcc] sources, "
+                            "but [dcc] ldc lists none; add the LDC XML files or remove dcc-ldc")
 
     sensor = Sensor(
         id=sid,
@@ -272,3 +290,19 @@ def discover(sensors_dir, broken=None):
             continue
         sensors[sensor.id] = sensor
     return sensors
+
+
+def plugin_descriptor(sensor_id, environ=None):
+    """The descriptor tiovxisp loads for sensor-name=sensor_id, or None.
+
+    Same lookup as camera_isp_sdk_sensor_find(): <dir>/<id>/sensor.conf, then
+    <dir>/<id>.conf, for each directory of $CAMERA_ISP_SDK_SENSOR_PATH.
+    """
+    environ = os.environ if environ is None else environ
+    for d in (environ.get(SENSOR_PATH_ENV) or SENSOR_PATH_DEFAULT).split(":"):
+        if not d:
+            continue
+        for candidate in (Path(d) / sensor_id / "sensor.conf", Path(d) / f"{sensor_id}.conf"):
+            if candidate.is_file():
+                return candidate
+    return None

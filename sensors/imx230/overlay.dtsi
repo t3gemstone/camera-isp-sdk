@@ -5,9 +5,6 @@
  * macros so it also works on CSI1.
  */
 
-#define CAM_DATA_LANES	1 2
-#define CAM_CLOCK_NONCONTINUOUS
-
 /*
  * The driver requires a 24 MHz xclk and the VANA, VDIG and VDDL supplies.
  * The adapter powers itself, so the regulators are placeholders.
@@ -65,10 +62,12 @@
 		port {
 			CAM_SENSOR_EP: endpoint {
 				remote-endpoint = <&CAM_RX_EP>;
-				link-frequencies = /bits/ 64 <493500000>;
+				link-frequencies = /bits/ 64 <CAM_LINK_FREQ>;
 				clock-lanes = <0>;
 				data-lanes = <CAM_DATA_LANES>;
+#ifdef CAM_CLOCK_NONCONTINUOUS
 				clock-noncontinuous;
+#endif
 			};
 		};
 	};

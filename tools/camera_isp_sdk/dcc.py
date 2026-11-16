@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 TI_IMAGING_REF = "REL.IMAGING.11.00.00.00"
 TI_TOOL = "dcc_gen_linux"
@@ -53,6 +53,8 @@ HEADER_WORDS = 20
 HEADER_SIZE_WORD = 19
 
 MODULE_ID_RE = re.compile(r"(<camera_module_id>\s*)(\d+)(\s*</camera_module_id>)")
+# Paths are relative to the [dcc] source directory, where dcc_gen_linux runs
+INCLUDE_RE = re.compile(r'(#include\s+")([^"]+)(")')
 H3A_BLOCK_RE = re.compile(r"(<h3a_aewb_dcc\b[^>]*>\s*\{)(.*?)(\}\s*</h3a_aewb_dcc>)", re.S)
 H3A_FIELDS = (
     "enable", "mode", "v_start", "h_start", "v_size", "h_size", "v_count", "h_count",
@@ -268,8 +270,21 @@ def inspect(path):
 # XML sources
 
 
+def _read(xml_path):
+    return Path(xml_path).read_text(errors="replace")
+
+
+def includes(text):
+    """Files an XML source includes."""
+    return [m.group(2) for m in INCLUDE_RE.finditer(text)]
+
+
+def _module_ids(text):
+    return [int(m.group(2)) for m in MODULE_ID_RE.finditer(text)]
+
+
 def xml_module_ids(xml_path):
-    return [int(m.group(2)) for m in MODULE_ID_RE.finditer(Path(xml_path).read_text(errors="replace"))]
+    return _module_ids(_read(xml_path))
 
 
 def set_module_id(text, dcc_id):
@@ -282,15 +297,18 @@ def _h3a_numbers(body):
         yield m
 
 
-def read_h3a(xml_path):
-    text = Path(xml_path).read_text(errors="replace")
+def _h3a(text, path):
     block = H3A_BLOCK_RE.search(text)
     if not block:
         return None
     values = [int(m.group(2)) for m in _h3a_numbers(block.group(2))]
     if len(values) != len(H3A_FIELDS):
-        raise DccError(f"{xml_path}: expected {len(H3A_FIELDS)} H3A AEWB values, found {len(values)}")
+        raise DccError(f"{path}: expected {len(H3A_FIELDS)} H3A AEWB values, found {len(values)}")
     return dict(zip(H3A_FIELDS, values))
+
+
+def read_h3a(xml_path):
+    return _h3a(_read(xml_path), xml_path)
 
 
 def _even_floor(value):
@@ -328,9 +346,7 @@ def check_h3a(grid, width, height):
     return problems
 
 
-def write_h3a(xml_path, grid):
-    path = Path(xml_path)
-    text = path.read_text()
+def _with_h3a(text, grid, path):
     block = H3A_BLOCK_RE.search(text)
     if not block:
         raise DccError(f"{path}: no h3a_aewb_dcc block")
@@ -344,7 +360,12 @@ def write_h3a(xml_path, grid):
         pieces.append(str(grid[name]))
         last = m.end(2)
     pieces.append(body[last:])
-    path.write_text(text[:block.start(2)] + "".join(pieces) + text[block.end(2):])
+    return text[:block.start(2)] + "".join(pieces) + text[block.end(2):]
+
+
+def write_h3a(xml_path, grid):
+    path = Path(xml_path)
+    path.write_text(_with_h3a(path.read_text(), grid, path))
 
 
 def _cfa_fir(text, path):
@@ -363,13 +384,8 @@ def _cfa_index(fir_set, phase, tap=0):
     return (fir_set * CFA_PHASES + phase) * CFA_TAPS + tap
 
 
-def read_cfa_bayer(xml_path):
-    """Bayer order the CFA (demosaic) coefficients were made for.
-
-    None if the file has no CFA block; DccError if the coefficients do not
-    follow the layout of TI's tunings.
-    """
-    _, fir = _cfa_fir(Path(xml_path).read_text(errors="replace"), xml_path)
+def _cfa_bayer(text, path):
+    _, fir = _cfa_fir(text, path)
     if fir is None:
         return None
 
@@ -378,8 +394,35 @@ def read_cfa_bayer(xml_path):
 
     red, blue = self_phases(CFA_RED_SET), self_phases(CFA_BLUE_SET)
     if len(red) != 1 or blue != [red[0] ^ 3]:
-        raise DccError(f"{xml_path}: cannot tell which Bayer order the CFA coefficients are for")
+        raise DccError(f"{path}: cannot tell which Bayer order the CFA coefficients are for")
     return next(order for order, phase in BAYER_RED_PHASE.items() if phase == red[0])
+
+
+def read_cfa_bayer(xml_path):
+    """Bayer order the CFA (demosaic) coefficients were made for.
+
+    None if the file has no CFA block; DccError if the coefficients do not
+    follow the layout of TI's tunings.
+    """
+    return _cfa_bayer(_read(xml_path), xml_path)
+
+
+def _with_cfa_bayer(text, order, path):
+    """text with the CFA kernels moved to the phases of order (see write_cfa_bayer)."""
+    shift = BAYER_RED_PHASE[_cfa_bayer(text, path)] ^ BAYER_RED_PHASE[order]
+    if not shift:
+        return text
+    block, fir = _cfa_fir(text, path)
+    body = block.group("body")
+    pieces, last = [], 0
+    for i, m in enumerate(fir):
+        fir_set, rest = divmod(i, CFA_PHASES * CFA_TAPS)
+        phase, tap = divmod(rest, CFA_TAPS)
+        pieces.append(body[last:m.start(1)])
+        pieces.append(fir[_cfa_index(fir_set, phase ^ shift, tap)].group(1))
+        last = m.end(1)
+    pieces.append(body[last:])
+    return text[:block.start("body")] + "".join(pieces) + text[block.end("body"):]
 
 
 def write_cfa_bayer(xml_path, order):
@@ -392,21 +435,11 @@ def write_cfa_bayer(xml_path, order):
     Returns whether the file changed.
     """
     path = Path(xml_path)
-    shift = BAYER_RED_PHASE[read_cfa_bayer(path)] ^ BAYER_RED_PHASE[order]
-    if not shift:
-        return False
     text = path.read_text()
-    block, fir = _cfa_fir(text, path)
-    body = block.group("body")
-    pieces, last = [], 0
-    for i, m in enumerate(fir):
-        fir_set, rest = divmod(i, CFA_PHASES * CFA_TAPS)
-        phase, tap = divmod(rest, CFA_TAPS)
-        pieces.append(body[last:m.start(1)])
-        pieces.append(fir[_cfa_index(fir_set, phase ^ shift, tap)].group(1))
-        last = m.end(1)
-    pieces.append(body[last:])
-    path.write_text(text[:block.start("body")] + "".join(pieces) + text[block.end("body"):])
+    moved = _with_cfa_bayer(text, order, path)
+    if moved == text:
+        return False
+    path.write_text(moved)
     return True
 
 
@@ -431,19 +464,20 @@ def check_sources(sensor):
         if not path.is_file():
             errors.append(f"DCC source {path} does not exist")
             continue
-        ids = set(xml_module_ids(path))
+        text = _read(path)
+        ids = set(_module_ids(text))
         if ids != {sensor.dcc_id}:
             errors.append(f"{path.name}: camera_module_id {sorted(ids)} differs from [isp] dcc-id "
                           f"{sensor.dcc_id}; TI's parser would reject it")
-        for inc in re.findall(r'#include\s+"([^"]+)"', path.read_text(errors="replace")):
+        for inc in includes(text):
             if not (sensor.dcc_source / inc).is_file():
                 errors.append(f"{path.name}: included file {inc} does not exist")
-        grid = read_h3a(path)
+        grid = _h3a(text, path)
         if grid:
             for problem in check_h3a(grid, sensor.mode.width, sensor.mode.height):
                 errors.append(f"{path.name}: {problem} (run 'camera-isp-sdk dcc fit-h3a {sensor.id}')")
         try:
-            bayer = read_cfa_bayer(path)
+            bayer = _cfa_bayer(text, path)
         except DccError as e:
             warnings.append(f"{e}; check the colours on the board")
             bayer = None
@@ -457,41 +491,51 @@ def check_sources(sensor):
 def bootstrap(template, new_id, dcc_id, dest, width, height, bayer=None, bundles=("viss", "2a")):
     """Copies a template sensor's DCC sources for a new sensor.
 
-    Copies the XML files of the given bundles and the files they include.
-    Files named <template>_*.xml are renamed to <new_id>_*.xml, the camera
-    module ID is rewritten, the H3A grid is fitted to the new frame size
-    and the CFA coefficients are moved to the phases of the bayer order.
-    Everything else (colour matrices, AWB tuning, noise filter) is the
-    template's and must be tuned for the new sensor. LDC is left out by
-    default: its mesh belongs to the template's lens.
+    Copies the XML files of the given bundles and the files they include,
+    keeping their paths relative to the source directory. Files named
+    <template>_* are renamed to <new_id>_*, and the #include lines of the
+    copied XML files follow the renames. The camera module ID is rewritten,
+    the H3A grid is fitted to the new frame size and the CFA coefficients
+    are moved to the phases of the bayer order. Everything else (colour
+    matrices, AWB tuning, noise filter) is the template's and must be tuned
+    for the new sensor. LDC is left out by default: its mesh belongs to the
+    template's lens.
+
+    Returns {path in the template's lists: path for the new sensor}.
     """
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     xmls = []
     for bundle in bundles:
         xmls += [x for x in template.dcc_bundles.get(bundle, []) if x not in xmls]
+    texts = {xml: (template.dcc_source / xml).read_text() for xml in xmls}
     files = list(xmls)
     for xml in xmls:
-        for inc in re.findall(r'#include\s+"([^"]+)"', (template.dcc_source / xml).read_text(errors="replace")):
-            if inc not in files:
-                files.append(inc)
+        files += [inc for inc in includes(texts[xml]) if inc not in files]
 
-    renames = {}
-    for src in (template.dcc_source / f for f in sorted(files)):
-        name = src.name
-        if name.startswith(f"{template.id}_"):
-            name = f"{new_id}_{name[len(template.id) + 1:]}"
-        renames[src.name] = name
-        target = dest / name
-        if src.suffix == ".xml":
-            target.write_text(set_module_id(src.read_text(), dcc_id))
-            if read_h3a(target):
-                write_h3a(target, fit_h3a(read_h3a(target), width, height))
-            try:
-                if bayer and read_cfa_bayer(target):
-                    write_cfa_bayer(target, bayer)
-            except DccError:
-                pass  # unknown CFA layout; validate warns about it
-        else:
+    def renamed(rel):
+        path = PurePosixPath(rel)
+        if path.name.startswith(f"{template.id}_"):
+            path = path.with_name(f"{new_id}_{path.name[len(template.id) + 1:]}")
+        return str(path)
+
+    renames = {rel: renamed(rel) for rel in files}
+    for rel in sorted(files):
+        src = template.dcc_source / rel
+        target = dest / renames[rel]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if src.suffix != ".xml":
             shutil.copyfile(src, target)
+            continue
+        text = set_module_id(texts[rel] if rel in texts else src.read_text(), dcc_id)
+        text = INCLUDE_RE.sub(lambda m: f"{m.group(1)}{renames.get(m.group(2), m.group(2))}{m.group(3)}", text)
+        grid = _h3a(text, src)
+        if grid:
+            text = _with_h3a(text, fit_h3a(grid, width, height), src)
+        try:
+            if bayer and _cfa_bayer(text, src):
+                text = _with_cfa_bayer(text, bayer, src)
+        except DccError:
+            pass  # unknown CFA layout; validate warns about it
+        target.write_text(text)
     return renames

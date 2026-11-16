@@ -7,8 +7,13 @@ the CAM_* port macros; the board provides a header per camera connector and
 the shared receiver plumbing (boards/<board>/camera-port.dtsi). This module
 glues them into one overlay per (sensor, port) and compiles it with the C
 preprocessor and dtc, the same way the kernel builds .dtso files.
+
+The CSI-2 link settings come from [csi] of the descriptor, as CAM_DATA_LANES,
+CAM_LINK_FREQ and CAM_CLOCK_NONCONTINUOUS, so that what validate checks is
+what the overlay programs.
 """
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,8 +21,34 @@ from pathlib import Path
 from . import __version__
 
 
+CSI_MACROS = ("CAM_DATA_LANES", "CAM_LINK_FREQ", "CAM_CLOCK_NONCONTINUOUS")
+_CSI_DEFINE_RE = re.compile(rf"^\s*#\s*define\s+({'|'.join(CSI_MACROS)})\b", re.M)
+
+
 class OverlayError(Exception):
     pass
+
+
+def dt_label(name):
+    """name made a valid device tree label ([A-Za-z_][A-Za-z0-9_]*)."""
+    label = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    return f"cam_{label}" if label[0].isdigit() else label
+
+
+def csi_defines(sensor):
+    """#define lines of the CSI-2 settings in [csi] of the descriptor."""
+    lines = [
+        f"#define CAM_DATA_LANES\t{' '.join(str(lane) for lane in range(1, sensor.lanes + 1))}",
+        f"#define CAM_LINK_FREQ\t{sensor.link_frequency}",
+    ]
+    if sensor.clock_noncontinuous:
+        lines.append("#define CAM_CLOCK_NONCONTINUOUS")
+    return lines
+
+
+def fragment_csi_defines(sensor):
+    """CSI macros the sensor fragment defines itself, which it must not."""
+    return _CSI_DEFINE_RE.findall(sensor.overlay.read_text(errors="replace")) if sensor.overlay.is_file() else []
 
 
 def wrapper_source(root, board, sensor, port):
@@ -34,6 +65,9 @@ def wrapper_source(root, board, sensor, port):
         "#include <dt-bindings/gpio/gpio.h>",
         f'#include "{board.ports[port].header}"',
         '#include <camera-isp-sdk/camera.h>',
+        "",
+        f"// [csi] of {sensor.path.relative_to(root)}",
+        *csi_defines(sensor),
         "",
         f'#include "{sensor.overlay}"',
         "",
@@ -65,6 +99,10 @@ def build(root, board, sensor, port, out_dir):
         raise OverlayError(f"{sensor.overlay} does not exist")
     if not board.ports[port].header.is_file():
         raise OverlayError(f"{board.ports[port].header} ({port} header of {board.id}) does not exist")
+    redefined = fragment_csi_defines(sensor)
+    if redefined:
+        raise OverlayError(f"{sensor.overlay} defines {', '.join(redefined)}; they come from [csi] in "
+                           f"{sensor.path.name} now, remove the #define")
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

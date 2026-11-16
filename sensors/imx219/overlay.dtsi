@@ -5,8 +5,6 @@
  * Schematics: https://datasheets.raspberrypi.com/camera/camera-v2-schematics.pdf
  */
 
-#define CAM_DATA_LANES	1 2
-
 &{/} {
 	CAM_LABEL(imx219_xclk): CAM_LABEL(imx219_xclk) {
 		compatible = "fixed-clock";
@@ -30,9 +28,12 @@
 		port {
 			CAM_SENSOR_EP: endpoint {
 				remote-endpoint = <&CAM_RX_EP>;
-				link-frequencies = /bits/ 64 <456000000>;
+				link-frequencies = /bits/ 64 <CAM_LINK_FREQ>;
 				clock-lanes = <0>;
 				data-lanes = <CAM_DATA_LANES>;
+#ifdef CAM_CLOCK_NONCONTINUOUS
+				clock-noncontinuous;
+#endif
 			};
 		};
 	};

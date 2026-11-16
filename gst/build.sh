@@ -46,8 +46,11 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 
+# Prints nothing when tiovxisp is not installed. It must not fail then:
+# with errexit and pipefail, plugin="$(plugin_file)" would exit the script
+# silently before any check of $plugin.
 plugin_file() {
-	gst-inspect-1.0 tiovxisp 2>/dev/null | awk '/^  Filename/ { print $2 }'
+	gst-inspect-1.0 tiovxisp 2>/dev/null | awk '/^  Filename/ { print $2 }' || true
 }
 
 # What the plugin is built from; stored next to it as <plugin>.camera-isp-sdk-sha256

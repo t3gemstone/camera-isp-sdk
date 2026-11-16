@@ -86,7 +86,9 @@ def cmd_validate(ctx, args):
             print(f"{name}: FAIL\n  error: {error}")
             failed = True
     if args.sensors:
-        selected = ctx.select([n for n in args.sensors if n not in ctx.broken])
+        wanted = [n for n in args.sensors if n not in ctx.broken]
+        # select([]) means every sensor
+        selected = ctx.select(wanted) if wanted else {}
     else:
         selected = all_sensors
     for sensor in selected.values():
@@ -226,6 +228,7 @@ def cmd_new(ctx, args):
                         for b in ("viss", "2a"))
     values = {
         "@ID@": args.id,
+        "@LABEL@": overlay.dt_label(args.id),
         "@NAME@": args.name or args.id,
         "@WIDTH@": str(args.width),
         "@HEIGHT@": str(args.height),
@@ -234,8 +237,11 @@ def cmd_new(ctx, args):
         "@DCC_ID@": str(args.dcc_id),
         "@DCC_BUNDLES@": bundles,
         "@DCC_FROM@": template.id,
-        "@DCC_BITS@": str(template.dcc_bits or ""),
     }
+    if template.dcc_bits is not None:
+        values["bits=@DCC_BITS@"] = f"bits={template.dcc_bits}"
+    else:
+        values["bits=@DCC_BITS@"] = f"# TODO: {template.id} does not say; set it once known\n#bits="
     for name in ("sensor.conf", "overlay.dtsi", "README.md"):
         text = (ctx.root / "sensors" / "_template" / name).read_text()
         for key, value in values.items():
@@ -243,7 +249,11 @@ def cmd_new(ctx, args):
         (dest / name).write_text(text)
 
     print(f"created {dest}")
-    if template.dcc_bits != bits:
+    if template.dcc_bits is None:
+        print(f"  warning: {template.id} does not say which bit depth its DCC sources are for ([dcc] bits). "
+              f"Check that its decompand, H3A mux LUT, CFA, NSF4 and black level components suit {bits}-bit "
+              "data (docs/tuning.md), then set [dcc] bits.")
+    elif template.dcc_bits != bits:
         print(f"  warning: {template.id}'s DCC sources are for {template.dcc_bits}-bit data, {args.code} is "
               f"{bits}-bit. Replace the decompand, H3A mux LUT, CFA, NSF4 and black level components "
               "with ones made for this bit depth (docs/tuning.md), then set [dcc] bits.")
@@ -299,14 +309,19 @@ def cmd_setup(ctx, args):
         print(f"    device    = {cam.video_link} -> {cam.video}")
         print(f"    subdev    = {cam.subdev_link} -> {cam.subdev}")
         print(f"    format    = {s.mode.media_ctl_format}")
+        if cam.frame_rate is not None:
+            print(f"    framerate = {cam.frame_rate:.2f} fps")
         print(f"    isp       = tiovxisp sensor-name={s.id} (DCC ID {s.dcc_id})")
+        if cam.frame_rate is not None and abs(cam.frame_rate - s.mode.fps) > media.FPS_TOLERANCE * s.mode.fps:
+            print(f"  warning: the driver's timing gives {cam.frame_rate:.2f} fps, [mode] fps is {s.mode.fps}; "
+                  "set [mode] vblank (docs/sensor-descriptor.md)")
     return status
 
 
 def cmd_pipeline(ctx, args):
     sensor = ctx.select([args.sensor])[args.sensor]
-    video = f"/dev/video-{sensor.id}-cam{args.cam}"
-    subdev = f"/dev/v4l-{sensor.id}-subdev{args.cam}"
+    video = media.video_link(sensor.id, args.cam)
+    subdev = media.subdev_link(sensor.id, args.cam)
     scale = None
     if args.scale:
         m = re.fullmatch(r"(\d+)x(\d+)", args.scale)
@@ -322,7 +337,11 @@ def cmd_pipeline(ctx, args):
         print(pipeline.format_command(cmd))
         return 0
     env = dict(os.environ)
-    env.setdefault("CAMERA_ISP_SDK_SENSOR_PATH", str(sensor.dir.parent))
+    tree = str(sensor.dir.parent)
+    if descriptor.SENSOR_PATH_ENV not in env and tree not in descriptor.SENSOR_PATH_DEFAULT.split(":"):
+        # A source tree: its descriptors stand in for the installed ones,
+        # the overrides in /etc still come first
+        env[descriptor.SENSOR_PATH_ENV] = f"{descriptor.SENSOR_OVERRIDE_DIR}:{tree}"
     return subprocess.call(cmd, env=env)
 
 
@@ -410,9 +429,10 @@ def cmd_doctor(ctx, args):
         s = cam.sensor
         module = s.module.replace("-", "_")
         healthy &= _check(Path(f"/sys/module/{module}").exists(), f"{s.id}: kernel module {s.module}")
-        conf = INSTALLED_ROOT / "sensors" / s.id / "sensor.conf"
-        healthy &= _check(conf.is_file() or "CAMERA_ISP_SDK_SENSOR_PATH" in os.environ,
-                          f"{s.id}: descriptor visible to tiovxisp ({conf})")
+        conf = descriptor.plugin_descriptor(s.id)
+        search = os.environ.get(descriptor.SENSOR_PATH_ENV) or descriptor.SENSOR_PATH_DEFAULT
+        healthy &= _check(conf is not None, f"{s.id}: descriptor visible to tiovxisp "
+                          f"({conf or f'none in {search}'})")
         for bundle in ("viss", "2a"):
             path = s.dcc_path(bundle)
             if not Path(path).is_file():
@@ -421,8 +441,9 @@ def cmd_doctor(ctx, args):
             ids = sorted({c.module_id for c in dcc.inspect(path)})
             healthy &= _check(ids == [s.dcc_id], f"{s.id}: {path} camera module ID {ids}"
                               f"{'' if ids == [s.dcc_id] else f', descriptor says {s.dcc_id}'}")
-        links = Path(cam.video_link).exists() and Path(cam.subdev_link).exists()
-        healthy &= _check(links, f"{s.id}: {cam.video_link} ({'present' if links else 'run camera-isp-sdk setup'})")
+        links = cam.links_ok()
+        healthy &= _check(links, f"{s.id}: {cam.video_link} "
+                          f"({'present' if links else 'missing or stale; run camera-isp-sdk setup'})")
     return 0 if healthy else 1
 
 
@@ -541,6 +562,6 @@ def main(argv=None):
                   f"(the board has only the installed data in {INSTALLED_ROOT})", file=sys.stderr)
             return 1
         return args.func(ctx, args)
-    except (ConfError, dcc.DccError, overlay.OverlayError, media.MediaError, FileNotFoundError, ValueError) as e:
+    except (ConfError, dcc.DccError, overlay.OverlayError, media.MediaError, OSError, ValueError) as e:
         print(f"camera-isp-sdk: error: {e}", file=sys.stderr)
         return 1

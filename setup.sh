@@ -166,13 +166,18 @@ next_steps_msg() {
 }
 
 main() {
-    intro_msg
-    delay 3
+    parse_flags "$@"
+    if [ "$SILENT" -eq 0 ]; then
+        intro_msg
+        delay 3
+    fi
     check_requirements
     install_docker
     set_docker_perms
     install_devbox
-    next_steps_msg
+    if [ "$SILENT" -eq 0 ]; then
+        next_steps_msg
+    fi
 }
 
 main "$@"

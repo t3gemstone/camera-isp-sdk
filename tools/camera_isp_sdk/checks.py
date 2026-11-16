@@ -7,7 +7,7 @@ silently: a width the capture DMA cannot take, a DCC ID the ISP ignores,
 an H3A grid outside the frame, a link the D-PHY cannot run.
 """
 
-from . import dcc
+from . import dcc, overlay
 
 # DCC IDs of the sensors built into TI's Edge AI 11.0 stack
 TI_DCC_IDS = {219: "IMX219", 233: "AR0233", 390: "IMX390", 820: "AR0820", 2312: "OV2312", 5: "OX05B1S"}
@@ -60,6 +60,9 @@ def check(sensor, board, all_sensors=None):
 
     if not sensor.overlay.is_file():
         errors.append(f"overlay fragment {sensor.overlay} does not exist")
+    for name in overlay.fragment_csi_defines(sensor):
+        errors.append(f"{sensor.overlay.name} defines {name}; it comes from [csi] in {sensor.path.name}, "
+                      "remove the #define")
     if sensor.driver_dir is not None and not (sensor.driver_dir / "Kbuild").is_file():
         errors.append(f"driver directory {sensor.driver_dir} has no Kbuild file")
 
